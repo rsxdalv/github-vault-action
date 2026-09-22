@@ -1,0 +1,119 @@
+name: github-vault
+description: Fetch secrets from github-vault using a GitHub OIDC token.
+author: rsxdalv
+
+inputs:
+  host:
+    description: Base URL of the github-vault instance.
+    required: true
+  names:
+    description: Comma-separated list of secret names to fetch.
+    required: true
+  audience:
+    description: JWT audience claim for the OIDC token.
+    required: false
+    default: github-vault
+  fail-on-deny:
+    description: Fail the step if any requested secret was denied or not found.
+    required: false
+    default: "true"
+
+outputs:
+  json:
+    description: Raw JSON response from the vault.
+    value: ${{ steps.fetch.outputs.json }}
+  denied:
+    description: Newline-separated list of names that were denied or not found.
+    value: ${{ steps.fetch.outputs.denied }}
+
+runs:
+  using: composite
+  steps:
+    - id: fetch
+      shell: bash
+      env:
+        VAULT_HOST: ${{ inputs.host }}
+        VAULT_NAMES: ${{ inputs.names }}
+        VAULT_AUDIENCE: ${{ inputs.audience }}
+        FAIL_ON_DENY: ${{ inputs.fail-on-deny }}
+      run: |
+        set -euo pipefail
+
+        # Mint a GitHub OIDC token bound to this repo + audience
+        AUDIENCE="$VAULT_AUDIENCE"
+        TOKEN=$(curl -fsS \
+          -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${AUDIENCE}" \
+          | jq -r .value)
+
+        if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+          echo "::error::Failed to mint OIDC token (empty response)" >&2
+          exit 1
+        fi
+
+        # Build the names JSON array. Split CSV first, then map each through
+        # jq -R so empty/whitespace entries get dropped and quoting is safe.
+        NAMES_JSON=$(printf '%s' "$VAULT_NAMES" \
+          | tr ',' '\n' \
+          | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+          | awk 'length > 0' \
+          | jq -R . | jq -s '.')
+
+        # Fetch — repo is derived from the token, no spoofable body fields
+        RESPONSE=$(curl -fsS -X POST "${VAULT_HOST%/}/api/v1/secrets" \
+          -H "Authorization: Bearer $TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"names\": ${NAMES_JSON}}")
+
+        # Always surface raw JSON
+        {
+          echo "json<<EOF"
+          echo "$RESPONSE"
+          echo "EOF"
+        } >> "$GITHUB_OUTPUT"
+
+        # Set per-secret outputs + env vars. The env-var export is what powers
+        # the "bootstrap CI secrets" use case: values land in $GITHUB_ENV so any
+        # downstream step can reference them as ${{ env.NAME }} or as a regular
+        # env var.
+        echo "$RESPONSE" | jq -c '.secrets // []' | \
+          jq -r '.[] | "\(.name)=\(.value)"' | while IFS='=' read -r name value; do
+            [ -z "$name" ] && continue
+            # Mask the value in any subsequent log output (echo statements,
+            # downstream step env dumps, error annotations).
+            echo "::add-mask::$value"
+            {
+              echo "${name}<<EOF"
+              echo "$value"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            {
+              echo "${name}<<EOF"
+              echo "$value"
+              echo "EOF"
+            } >> "$GITHUB_ENV"
+          done
+
+        # Surface denied names — both as workflow warnings and as an output
+        # list so callers can gate subsequent steps on it.
+        DENIED=$(echo "$RESPONSE" | jq -r '
+          [(.denied // [])[]? | .name] | unique | join("\n")
+        ')
+        if [ -n "$DENIED" ]; then
+          {
+            echo "denied<<EOF"
+            echo "$DENIED"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "$RESPONSE" | jq -r '
+            (.denied // [])[]? |
+            "::warning file=\(.name)::\(.reason)"
+          '
+        fi
+
+        # Optionally fail the step if anything was denied — makes the failure
+        # obvious in the UI instead of silently continuing with empty vars.
+        if [ "$FAIL_ON_DENY" = "true" ] && [ -n "$DENIED" ]; then
+          echo "::error::github-vault denied: $(echo "$DENIED" | tr '\n' ',')" >&2
+          exit 1
+        fi

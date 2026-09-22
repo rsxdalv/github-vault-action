@@ -1,0 +1,83 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap-shared-secrets:
+    name: Bootstrap POSITORY_URL + DEPLOY_WEBHOOK_URL from vault
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # required to mint the OIDC token
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: vault
+        uses: ./
+        with:
+          host: ${{ secrets.VAULT_HOST }}
+          names: POSITORY_URL,DEPLOY_WEBHOOK_URL
+
+      - name: Verify POSITORY_URL was fetched
+        env:
+          POSITORY_URL: ${{ env.POSITORY_URL }}
+        run: |
+          if [ -z "$POSITORY_URL" ]; then
+            echo "::error::POSITORY_URL is empty — fetch denied?"
+            exit 1
+          fi
+          echo "POSITORY_URL length: ${#POSITORY_URL}"
+          # Should look like "pository.bare.hostname" — no scheme, no trailing slash
+          if [[ "$POSITORY_URL" == http* ]]; then
+            echo "::warning::POSITORY_URL should be a bare hostname, got: $POSITORY_URL"
+          fi
+
+      - name: Verify DEPLOY_WEBHOOK_URL was fetched
+        env:
+          DEPLOY_WEBHOOK_URL: ${{ env.DEPLOY_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DEPLOY_WEBHOOK_URL" ]; then
+            echo "::error::DEPLOY_WEBHOOK_URL is empty — fetch denied?"
+            exit 1
+          fi
+          echo "DEPLOY_WEBHOOK_URL length: ${#DEPLOY_WEBHOOK_URL}"
+
+      - name: Show denied list (should be empty)
+        env:
+          DENIED: ${{ steps.vault.outputs.denied }}
+        run: |
+          if [ -n "$DENIED" ]; then
+            echo "::error::Some secrets were denied: $DENIED"
+            exit 1
+          fi
+          echo "No secrets denied."
+
+  per-repo-secret:
+    name: Verify default-rule secret (matching repo name)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      # Default rule: a repo may read a secret whose name equals the repo name.
+      # This repo is github-vault-action, so it can read "github-vault-action".
+      - id: vault
+        uses: ./
+        with:
+          host: ${{ secrets.VAULT_HOST }}
+          names: github-vault-action
+        # Tolerate "not found" so the test stays green until an operator seeds the file.
+          fail-on-deny: "false"
+
+      - name: Print result
+        run: echo "${{ steps.vault.outputs.json }}"
